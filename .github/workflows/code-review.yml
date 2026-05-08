@@ -1,0 +1,142 @@
+name: CodeGuard AI – Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  codeguard-review:
+    name: Run CodeGuard AI Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # Full history needed for diff
+
+      # ── Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CodeGuard AI dependencies
+        run: pip install -r requirements.txt
+
+      # ── Collect changed Python files ──────────────────────────────────────
+      - name: Get changed Python files
+        id: changed-files
+        run: |
+          # Compare with the base branch of the PR
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FILES=$(git diff --name-only --diff-filter=ACM "$BASE" "$HEAD" \
+                  | grep '\.py$' || true)
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FILES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "::notice::Changed Python files: $(echo "$FILES" | wc -l)"
+
+      # ── Run CodeGuard AI ──────────────────────────────────────────────────
+      - name: Run CodeGuard AI on changed files
+        id: review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -e
+          CHANGED_FILES="${{ steps.changed-files.outputs.files }}"
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No Python files changed. Skipping review."
+            echo "report=_No Python files were changed in this PR._" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          COMBINED_REPORT=""
+          EXIT_CODE=0
+
+          while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            echo "Reviewing: $FILE"
+
+            # Run CodeGuard AI; capture report and log stderr separately
+            FILE_REPORT=$(python main.py "$FILE" 2>>/tmp/codeguard_stderr.log) || FILE_EXIT=$?
+            EXIT_CODE=$((EXIT_CODE > ${FILE_EXIT:-0} ? EXIT_CODE : ${FILE_EXIT:-0}))
+
+            COMBINED_REPORT="${COMBINED_REPORT}
+          ${FILE_REPORT}
+
+          ---
+          "
+          done <<< "$CHANGED_FILES"
+
+          # Persist combined report
+          echo "$COMBINED_REPORT" > /tmp/codeguard_report.md
+
+          # Pass exit code downstream (used to set PR check status)
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      # ── Post PR comment ───────────────────────────────────────────────────
+      - name: Post review as PR comment
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let body;
+            try {
+              body = fs.readFileSync('/tmp/codeguard_report.md', 'utf8').trim();
+            } catch (e) {
+              body = '_CodeGuard AI did not produce a report for this PR._';
+            }
+            if (!body) {
+              body = '_No Python files were changed in this PR._';
+            }
+
+            // Truncate very long reports to stay within GitHub's comment limit
+            const MAX_CHARS = 65000;
+            if (body.length > MAX_CHARS) {
+              body = body.slice(0, MAX_CHARS) + '\n\n_...report truncated due to length..._';
+            }
+
+            const header = '<!-- codeguard-ai-review -->';
+            const fullBody = `${header}\n${body}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            // Update existing comment if present (avoid duplicate comments)
+            const existing = comments.find(c => c.body && c.body.startsWith(header));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+              console.log('Updated existing CodeGuard AI comment.');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+              console.log('Created new CodeGuard AI comment.');
+            }
+
+      # ── Run tests ─────────────────────────────────────────────────────────
+      - name: Run CodeGuard AI test suite
+        run: python -m pytest tests/ -v --tb=short
